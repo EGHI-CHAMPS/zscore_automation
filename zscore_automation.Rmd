@@ -1,0 +1,251 @@
+---
+title: "Z-score Automation for MITS Anthropometric Measures"
+author: "Priya Gupta & Afrin Jahan. Modifications by Kyu Han Lee. Current point of contact: klee75@emory.edu."
+output:
+  word_document: default
+---
+
+***
+__Objective:__ Automate the calculation of z-scores based on the World Health Organization (WHO) Growth Standards (WHO-GS) using the WHO “Anthro” package to classify malnutrition among children. 
+
+__Methods:__ The MITS Anthropometric measures and DeCoDe data files will be used in conjunction with the WHO “Anthro” package to generate z scores for anthropometric indices. These Z scores will be used to define malnutrition based on 2020 CHAMPS codes. Z-scores and classification of malnutrition will be output into a CSV file for upload into the REDCap Z score Report. This report should be run once a month.  
+
+***
+
+1. Create local directory for given month with the following subdirectories: a) Data, b) Export, c) R Code, and d) CSV for Redcap upload. Download a) MITS Procedure Measurements Pivot View and b) DeCoDe Measures ALL Table: Eligible, nonMITS, and MITS (Site-Specific) from Labkey. Note: DeCoDe file - Filter for MITS Flag = 1 prior to exporting. Use default settings in LabKey when downloading xlsx. Open excel files and convert all error fields to numeric value. Click save as and rename files using the following format : "MITS.xlsx" & "DECODE.xlsx". 
+
+2. Load libraries and read the data **(MITS Anthropometric Measures and DeCoDe)** into R. Specify user file path where downloaded datasets are saved. 
+```{r message=FALSE, warning=FALSE, include=FALSE}
+rm(list = ls())
+gc()
+
+packages_list <- c("anthro", "dplyr", "tidyverse", "eeptools", "readxl", "openxlsx")
+new_packages <- packages_list[!(packages_list %in% installed.packages()[,"Package"])]
+if(length(new_packages)) install.packages(new_packages, dependencies = TRUE)
+sapply(packages_list, require, character.only = TRUE)
+rm(new_packages, packages_list)
+
+#Specify File path 
+data.src <- file.path("") 
+
+#MITS
+mitswide <- read.xlsx(file.path(data.src,"Data/MITS.xlsx"), detectDates = T)
+sapply(mitswide,class)
+
+#DECODE
+decode <- read.xlsx(file.path(data.src,"Data/DECODE.xlsx"), detectDates = T)
+sapply(decode,class)
+
+```
+
+3. Subset variables of interest and bind with MITS data file. These include: **CHAMPSID, Weight, Height/Length, Mid-Upper Arm Circumference, Head Circumference, Right Leg Length, Right Foot Length, Sex, Date of birth, Date of death, Case type, Site Name**
+```{r message=FALSE, warning=FALSE, include=FALSE}
+#Keep ChampsID, Sex, DOB, DOD, & Site Name 
+decode <- select(decode, Champs.Id, Calc.Sex, Calc.Dob, Calc.Dod, Site.Name)
+
+#Join MITS and DeCoDe
+mitsdecode <- left_join(mitswide, decode, by="Champs.Id")
+str(mitsdecode)
+sapply(mitsdecode, class)
+
+```
+
+4. Create new variables for Anthro R Package - **Sex (Male, Female) & Age (Days, Months)** and rename anthropometric measures.   
+```{r message=FALSE, warning=FALSE, include=FALSE}
+
+require(lubridate)
+mitsdecode <- within(mitsdecode, {
+  sex <- ifelse(Calc.Sex == "CH00030", "M", ifelse(Calc.Sex == "CH00031", "F", NA))
+  sex <- factor(sex)
+  sexn <- ifelse(sex == "M", 1, ifelse(sex == "F", 2, NA))
+  calculate_age <- interval(ymd(Calc.Dob), ymd(Calc.Dod))
+  age_d <- calculate_age %/% days(1)
+  age_m <- calculate_age %/% months(1)
+  htlg <- Height.Cm
+  wt <- Weight.Kg
+  muac <- MUAC.Cm
+  hc <- Head.Circumf.Cm
+  rfl<- Right.Foot.Length.Cm
+  rll <- Right.Leg.Length.Cm
+  #Using ABS value to include negative age values (if any)
+  age_d <- abs(age_d)
+})
+table(mitsdecode$sex, mitsdecode$sexn)
+summary(mitsdecode$age_m)
+summary(mitsdecode$age_d)
+
+mitsdecode<-mitsdecode %>%
+  mutate(wt=as.numeric(wt),
+         htlg=as.numeric(htlg),
+         hc=as.numeric(hc),
+         muac=as.numeric(muac))
+
+```
+
+5. Subset the data and keep non-missing observations for DOB, DOD, sex, and exclude stillbirths.
+```{r}
+excluded <-subset(mitsdecode, is.na(mitsdecode$Calc.Dob) | is.na(mitsdecode$Calc.Dod) | is.na(mitsdecode$sexn)| mitsdecode$Case.Type == "CH00716") 
+
+mitsdecode <-subset(mitsdecode, !is.na(mitsdecode$Calc.Dob) & !is.na(mitsdecode$Calc.Dod) & !is.na(mitsdecode$sexn) & mitsdecode$Case.Type!="CH00716") 
+
+```
+
+6. Use **anthro_zscores** function to calculate z-scores for anthropometric indicators, weight-for-age, length/height-for-age, weight-for-length/height, body mass index (BMI)-for-age,  head circumference-for-age and arm circumference-for-age based on the WHO Child Growth Standards. 
+```{r message=FALSE, warning=FALSE, include=FALSE}
+who <- with(mitsdecode,
+            anthro_zscores(
+              sex = sexn, 
+              age = age_d,
+              is_age_in_month = FALSE, 
+              weight = wt, 
+              lenhei = htlg,
+              headc = hc,
+              armc = muac))
+
+#Bind zscores to Mitsdecode data
+whomitsdecode <- cbind(mitsdecode, who)
+str(whomitsdecode) 
+
+```
+
+7. Create variables to classify malnutrition based on 2020 CHAMPS codes. 
+```{r include=FALSE}
+#Classify UNDERWEIGHT
+whomitsdecode <- within(whomitsdecode, {
+  weicat <- ifelse(is.na(zwei) & fwei==0, NA,  
+                    ifelse(zwei>= -2 & zwei<= 5 & fwei== 0, "Not underweight",
+                      ifelse(zwei>= -2 & fwei== 1, "Not underweight* confirm with all available data",
+                        ifelse(zwei>= -3 & zwei< -2 & fwei== 0, "Moderately underweight",  
+                          ifelse(zwei>= -6 & zwei< -3 & fwei== 0, "Severely underweight",
+                            ifelse(zwei< -3 & fwei== 1, "Severely underweight* confirm with all available data", NA))))))
+  
+#Classify STUNTING  
+  lencat <- ifelse(is.na(zlen) & flen== 0, NA,     
+              ifelse(zlen>= -2 & zlen <=3 & flen== 0, "Not stunted", ## Updated definition of upper bound 1/20/22                             
+                ifelse(zlen>= -3 & zlen< -2 & flen== 0, "Moderately stunted", 
+                  ifelse(zlen>= -6 & zlen< -3 & flen== 0, "Severely stunted",
+                    ifelse(zlen< -3 & flen== 1, "Severely stunted* confirm with all available data",  
+                      ifelse(zlen> 3 & zlen<= 6 & flen== 0, "High length/height-for-age", 
+                        ifelse(zlen> 3 & flen== 1, "High length/height-for-age* confirm with all available data", NA)))))))
+  
+#Classify WASTING
+  wflcat <-  ifelse(htlg <45 & is.na(zwfl) & is.na(fwfl), "Z-score cannot be calculated because child has a length below 45 cm; consider classifying nutritional status using gestational age",
+              ifelse(is.na(zwfl) & fwfl== 0, NA, 
+                ifelse(zwfl> 3 & zwfl<= 5 & fwfl== 0, "Obese",
+                  ifelse(zwfl> 3 & fwfl== 1, "Obese* confirm with all available data",
+                    ifelse(zwfl> 2 & zwfl<= 3 & fwfl== 0, "Overweight", 
+                      ifelse(zwfl>= -2 & zwfl<= 2 & fwfl== 0, "Normal Weight-for-Length",       
+                        ifelse(zwfl>= -3 & zwfl< -2 & fwfl== 0, "Moderately wasted",
+                          ifelse(zwfl>= -5 & zwfl< -3 & fwfl== 0, "Severely wasted",
+                            ifelse(zwfl< -3 & fwfl== 1, "Severely wasted* confirm with all available data", NA)))))))))
+  
+#Classify MUAC based on ZAC
+  muaccat1 <- ifelse(is.na(zac) & fac== 0, NA,                                                    
+                ifelse(zac>= -2 & zac<= 5 & fac== 0 & age_m>=3 & age_m<=59, "Within normal MUAC range (MUACZ >= -2)", 
+                  ifelse(zac>= -2 & fac== 1 & age_m>=3 & age_m<=59, "Within normal MUAC range* confirm with all available data",   
+                    ifelse(zac>= -3 & zac< -2 & fac== 0 & age_m>=3 & age_m<=59, "Moderate malnutrition (-3≤ MUACZ < -2)",  
+                      ifelse(zac>= -5 & zac< -3 & fac== 0 & age_m>=3 & age_m<=59,"Severe malnutrition (MUACZ < -3)",
+                        ifelse(zac< -3 & fac== 1 & age_m>=3 & age_m<=59,"Severe malnutrition* confirm with all available data",
+                         ifelse(age_m <3 | age_m >59, "Z-score cannot be calculated or interpretation unavailable because child fails to meet age requirement of 3-59", NA)))))))
+  
+#Classify MUAC based on RAW MEASURE
+  muaccat2 = case_when(muac>=12.5 & age_m>=6 & age_m<=59 ~ "Within Normal MUAC-for-age range (MUAC >12.5 cm)",
+                      muac>=11.5  & muac<=12.4 & age_m>=6 & age_m <=59 ~ "Moderate malnutrition (11.5≤ MUAC < 12.5 cm)",
+                      muac<11.5 & age_m>=6 & age_m<=59 ~ "Severe acute malnutrition (MUAC < 11.5 cm)",
+                      age_m <6 | age_m >59 ~ "Interpretation unavailable because child fails to meet age requirement of 6-59 months")
+                     
+  
+#Classify MACROCEPHALY 
+    hccat <- ifelse(is.na(zhc) & fhc==0, NA, 
+              ifelse(zhc< -3 & zhc>= -5 & fhc==0, "Severe microcephaly", 
+                ifelse(zhc< -3 & fhc==1, "Severe microcephaly* confirm with all available data", 
+                  ifelse(zhc>= -3 & zhc< -2 & fhc==0, "Microcephaly", 
+                    ifelse(zhc>= -2 & zhc<= 2 & fhc==0, "Normal head circumference-for-age",
+                      ifelse(zhc<= 5 & zhc> 2  & fhc==0, "Macrocephaly",
+                        ifelse(zhc> 2  & fhc==1, "Macrocephaly* confirm with all available data", NA)))))))
+  
+#Classify UNDERWEIGHT using CHAMPS Code 
+  weicatinterp = case_when(weicat == "Not underweight" ~ "CH01430", 
+                           weicat == "Not underweight* confirm with all available data" ~ "CH03161", 
+                           weicat == "Moderately underweight" ~ "CH01431", 
+                           weicat == "Severely underweight" ~ "CH01432",
+                           weicat == "Severely underweight* confirm with all available data" ~ "CH03155")
+
+#Classify STUNTING using CHAMPS Code 
+  lencatinterp = case_when(lencat == "Not stunted" ~ "CH01436",
+                           lencat == "Moderately stunted" ~ "CH01437",
+                           lencat == "Severely stunted" ~ "CH01438",
+                           lencat == "Severely stunted* confirm with all available data" ~ "CH03157",
+                           lencat == "High length/height-for-age" ~ "CH03059",
+                           lencat == "High length/height-for-age* confirm with all available data" ~ "CH03156")
+    
+#Classify WASTING using CHAMPS Code 
+  wflcatinterp = case_when(wflcat == "Z-score cannot be calculated because child has a length below 45 cm; consider classifying nutritional status using gestational age" ~ "CH03154",
+                           wflcat == "Obese" ~ "CH03050",
+                           wflcat == "Obese* confirm with all available data" ~ "CH03152",
+                           wflcat == "Overweight" ~ "CH03049",
+                           wflcat == "Normal Weight-for-Length" ~ "CH01433",
+                           wflcat == "Moderately wasted" ~ "CH01434",
+                           wflcat == "Severely wasted" ~ "CH01435",
+                           wflcat == "Severely wasted* confirm with all available data" ~ "CH03153")
+
+#Classify MUAC using CHAMPS Code
+  muaccatinterp1 = case_when(muaccat1 == "Within normal MUAC range (MUACZ >= -2)" ~ "CH01878",
+                             muaccat1 == "Within normal MUAC range* confirm with all available data" ~ "CH03164",
+                             muaccat1 == "Moderate malnutrition (-3≤ MUACZ < -2)" ~ "CH01879",
+                             muaccat1 == "Severe malnutrition (MUACZ < -3)" ~ "CH01880",
+                             muaccat1 == "Severe malnutrition* confirm with all available data" ~ "CH03160",
+                             muaccat1 == "Z-score cannot be calculated or interpretation unavailable because child fails to meet age requirement of 3-59" ~ "CH03165")
+                                   
+  muaccatinterp2 = case_when(muaccat2 == "Within Normal MUAC-for-age range (MUAC >12.5 cm)" ~ "CH03053",
+                             muaccat2 == "Moderate malnutrition (11.5≤ MUAC < 12.5 cm)" ~ "CH03052",
+                             muaccat2 == "Severe acute malnutrition (MUAC < 11.5 cm)" ~ "CH03501",
+                             muaccat2 == "Interpretation unavailable because child fails to meet age requirement of 6-59 months" ~ "CH03163")
+  
+#Classify MACROCEPHALY using CHAMPS Code 
+    zheadinterp = case_when(hccat == "Severe microcephaly" ~ "CH03055",
+                            hccat == "Severe microcephaly* confirm with all available data" ~ "CH03159",
+                            hccat == "Microcephaly" ~ "CH03056",
+                            hccat == "Normal head circumference-for-age" ~ "CH03057",
+                            hccat == "Macrocephaly" ~ "CH03058",
+                            hccat == "Macrocephaly* confirm with all available data" ~ "CH03158")
+
+})
+
+```
+
+8. Rename variable names per REDCAP SOP.  
+```{r}
+whomitsdecode <- whomitsdecode %>% rename(
+  
+  champs_id = Champs.Id,
+  calc_zwfl = zwfl,
+  calc_zwfl_interp = wflcatinterp,
+  calc_zwei = zwei,
+  calc_zwei_interp = weicatinterp,
+  calc_zlen = zlen,
+  calc_zlen_interp = lencatinterp,
+  calc_zhead = zhc,
+  calc_zhead_interp = zheadinterp, 
+  calc_rmuac = muac,
+  calc_rmuac_interp = muaccatinterp2,
+  calc_zmuac = zac,
+  calc_zmuac_interp = muaccatinterp1,
+  # =notes,
+  # =champs_zscore_form_complete
+)
+
+```
+
+9. Subset the data to include only the variables needed for the REDCAP upload and set all missing (NA's) to blank space (""). Export as CSV file and upload into REDCap. 
+```{r}
+#Subset the data and replace missing data with " "
+whomitsdecode1 <- select(whomitsdecode, champs_id, calc_zwfl, calc_zwfl_interp,  calc_zwei, calc_zwei_interp, calc_zlen, calc_zlen_interp, calc_zhead, calc_zhead_interp,  calc_rmuac, calc_rmuac_interp, calc_zmuac, calc_zmuac_interp)
+
+whomitsdecode1[is.na(whomitsdecode1)] <- " "
+
+#EXPORT AS CSV & UPLOAD INTO REDCAP
+write.csv(whomitsdecode1, "CSV for Redcap Upload/zscores.csv", row.names = F)
+```
+
+10. For errors/changes in the REDCap upload, add standard comment - "<date> z score automation upload". 
